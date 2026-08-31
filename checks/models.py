@@ -2,6 +2,7 @@
 
 from decimal import ROUND_HALF_UP, Decimal
 
+from django.conf import settings
 from django.core.validators import MinValueValidator
 from django.db import models
 from django.db.models import F, Sum
@@ -328,3 +329,117 @@ class Payment(models.Model):
 
     def __str__(self):
         return f"{self.participant} paid {self.amount}"
+
+
+class ReceiptUpload(models.Model):
+    """A photographed receipt, its parsed contents, and the check built from it."""
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "Waiting to be read"
+        PARSED = "parsed", "Read"
+        IMPORTED = "imported", "Check created"
+        FAILED = "failed", "Could not be read"
+
+    image = models.ImageField(upload_to="receipts/%Y/%m/")
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.PENDING)
+    bill = models.ForeignKey(
+        Check,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="uploads",
+        verbose_name="check",
+    )
+    participants = models.ManyToManyField(
+        Participant,
+        blank=True,
+        related_name="receipt_uploads",
+        help_text="Everyone here is put on every parsed item. Leave empty to split later.",
+    )
+
+    parsed_data = models.JSONField(null=True, blank=True, editable=False)
+    error = models.TextField(blank=True, editable=False)
+    model_used = models.CharField(max_length=64, blank=True, editable=False)
+    input_tokens = models.PositiveIntegerField(null=True, blank=True, editable=False)
+    output_tokens = models.PositiveIntegerField(null=True, blank=True, editable=False)
+
+    uploaded_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="receipt_uploads",
+    )
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+    parsed_at = models.DateTimeField(null=True, blank=True, editable=False)
+
+    class Meta:
+        ordering = ["-uploaded_at", "-id"]
+        verbose_name = "receipt upload"
+
+    def __str__(self):
+        merchant = (self.parsed_data or {}).get("merchant")
+        return merchant or f"Receipt #{self.pk or 'new'}"
+
+    @property
+    def reader_notes(self):
+        """What the model flagged as unreadable or worth checking."""
+        return (self.parsed_data or {}).get("reader_notes", "")
+
+    def parse(self, save=True):
+        """Read the image with Claude and store the structured result.
+
+        Failures are recorded on the row rather than raised, so a bad photo
+        leaves an explanation in the admin instead of a 500.
+        """
+        from .parsing import ReceiptParseError, parse_receipt_image
+
+        self.image.open("rb")
+        try:
+            raw = self.image.read()
+        finally:
+            self.image.close()
+
+        try:
+            parsed, usage = parse_receipt_image(raw)
+        except ReceiptParseError as exc:
+            self.status = self.Status.FAILED
+            self.error = str(exc)
+            self.parsed_data = None
+        else:
+            self.status = self.Status.PARSED
+            self.error = ""
+            self.parsed_data = parsed.model_dump()
+            self.model_used = usage.get("model", "")
+            self.input_tokens = usage.get("input_tokens")
+            self.output_tokens = usage.get("output_tokens")
+        self.parsed_at = timezone.now()
+
+        if save:
+            self.save(
+                update_fields=[
+                    "status",
+                    "error",
+                    "parsed_data",
+                    "model_used",
+                    "input_tokens",
+                    "output_tokens",
+                    "parsed_at",
+                ]
+            )
+        return self.status == self.Status.PARSED
+
+    def create_check(self):
+        """Build a draft check from the parsed data and link it to this upload."""
+        from .importers import build_check_from_parsed
+
+        if not self.parsed_data:
+            raise ValueError("This receipt has not been read yet.")
+
+        check = build_check_from_parsed(
+            self.parsed_data, participants=list(self.participants.all())
+        )
+        self.bill = check
+        self.status = self.Status.IMPORTED
+        self.save(update_fields=["bill", "status"])
+        return check
