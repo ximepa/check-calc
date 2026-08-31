@@ -9,7 +9,8 @@ from django.db.models.functions import Coalesce
 from django.urls import reverse
 from django.utils.html import format_html, format_html_join
 
-from .models import Check, CheckItem, ItemShare, Participant, Payment
+from .models import Check, CheckItem, ItemShare, Participant, Payment, ReceiptUpload
+from .parsing import to_decimal
 
 admin.site.site_header = "Check Calc administration"
 admin.site.site_title = "Check Calc"
@@ -423,3 +424,228 @@ class PaymentAdmin(admin.ModelAdmin):
 
     def get_queryset(self, request):
         return super().get_queryset(request).select_related("participant", "bill")
+
+
+@admin.register(ReceiptUpload)
+class ReceiptUploadAdmin(admin.ModelAdmin):
+    """Upload a photo of a receipt; Claude reads it and a draft check appears."""
+
+    list_display = (
+        "thumbnail",
+        "__str__",
+        "status_badge",
+        "parsed_items",
+        "parsed_total",
+        "linked_check",
+        "uploaded_at",
+    )
+    list_display_links = ("thumbnail", "__str__")
+    list_filter = ("status", "uploaded_at")
+    search_fields = ("bill__title", "error")
+    date_hierarchy = "uploaded_at"
+    autocomplete_fields = ["participants"]
+    actions = ["parse_receipts", "create_checks"]
+    list_per_page = 20
+
+    fieldsets = (
+        (
+            None,
+            {
+                "fields": ("image", "participants"),
+                "description": (
+                    "Upload a photo of the receipt. It is read automatically on save "
+                    "and a draft check is created from it."
+                ),
+            },
+        ),
+        ("Result", {"fields": ("status", "preview", "parsed_panel", "linked_check", "error")}),
+        (
+            "Request",
+            {
+                "fields": ("model_used", "input_tokens", "output_tokens", "uploaded_by", "parsed_at"),
+                "classes": ("collapse",),
+            },
+        ),
+    )
+    readonly_fields = (
+        "status",
+        "preview",
+        "parsed_panel",
+        "linked_check",
+        "error",
+        "model_used",
+        "input_tokens",
+        "output_tokens",
+        "uploaded_by",
+        "parsed_at",
+    )
+
+    def get_queryset(self, request):
+        return super().get_queryset(request).select_related("bill")
+
+    # -- columns and panels --------------------------------------------
+
+    @admin.display(description="")
+    def thumbnail(self, obj):
+        if not obj.image:
+            return "—"
+        return format_html(
+            '<img src="{}" style="height:52px;width:52px;object-fit:cover;'
+            'border-radius:4px;border:1px solid #ccc" alt="receipt">',
+            obj.image.url,
+        )
+
+    @admin.display(description="Receipt")
+    def preview(self, obj):
+        if not obj.image:
+            return "—"
+        return format_html(
+            '<a href="{0}" target="_blank"><img src="{0}" style="max-width:420px;'
+            'max-height:560px;border:1px solid #ccc;border-radius:4px"></a>',
+            obj.image.url,
+        )
+
+    @admin.display(description="Status", ordering="status")
+    def status_badge(self, obj):
+        colours = {
+            ReceiptUpload.Status.PENDING: ("#6c757d", "#f2f2f2"),
+            ReceiptUpload.Status.PARSED: ("#0b6bcb", "#e8f1fc"),
+            ReceiptUpload.Status.IMPORTED: ("#1e7a3c", "#e8f6ec"),
+            ReceiptUpload.Status.FAILED: ("#b32d2e", "#fdeaea"),
+        }
+        colour, background = colours.get(obj.status, ("#333", "#eee"))
+        return format_html(
+            '<span style="background:{};color:{};padding:2px 8px;border-radius:10px;'
+            'font-weight:600;white-space:nowrap">{}</span>',
+            background,
+            colour,
+            obj.get_status_display(),
+        )
+
+    @admin.display(description="Items")
+    def parsed_items(self, obj):
+        return len((obj.parsed_data or {}).get("items") or [])
+
+    @admin.display(description="Receipt total")
+    def parsed_total(self, obj):
+        total = (obj.parsed_data or {}).get("total")
+        return currency(to_decimal(total)) if total is not None else "—"
+
+    @admin.display(description="Check")
+    def linked_check(self, obj):
+        if not obj.bill:
+            return "—"
+        return format_html(
+            '<a href="{}">{}</a>',
+            reverse("admin:checks_check_change", args=[obj.bill_id]),
+            obj.bill,
+        )
+
+    @admin.display(description="What Claude read")
+    def parsed_panel(self, obj):
+        data = obj.parsed_data
+        if not data:
+            return "Not read yet."
+        rows = format_html_join(
+            "",
+            "<tr><td>{}</td><td style='text-align:right'>{}</td>"
+            "<td style='text-align:right'>{}</td></tr>",
+            (
+                (
+                    item.get("name", ""),
+                    f"{item.get('quantity', 1):g}",
+                    currency(to_decimal(item.get("unit_price"), Decimal("0.00"))),
+                )
+                for item in data.get("items") or []
+            ),
+        )
+        totals = format_html_join(
+            "",
+            "<tr><th style='text-align:left;padding-right:16px'>{}</th>"
+            "<td style='text-align:right'>{}</td></tr>",
+            (
+                (label, currency(to_decimal(data.get(key))) if data.get(key) is not None else "—")
+                for label, key in [
+                    ("Subtotal", "subtotal"),
+                    ("Discount", "discount"),
+                    ("Tax", "tax_amount"),
+                    ("Tip", "tip_amount"),
+                    ("Total", "total"),
+                ]
+            ),
+        )
+        notes = data.get("reader_notes") or ""
+        return format_html(
+            "<div><table><thead><tr><th style='text-align:left'>Item</th>"
+            "<th>Qty</th><th>Unit</th></tr></thead><tbody>{}</tbody></table>"
+            "<table style='margin-top:8px'>{}</table>{}</div>",
+            rows,
+            totals,
+            format_html("<p style='margin-top:8px'><em>{}</em></p>", notes) if notes else "",
+        )
+
+    # -- upload flow ----------------------------------------------------
+
+    def save_model(self, request, obj, form, change):
+        if obj.uploaded_by_id is None:
+            obj.uploaded_by = request.user
+        super().save_model(request, obj, form, change)
+
+    def save_related(self, request, form, formsets, change):
+        """Parse after the participants M2M is saved, so shares can be assigned."""
+        super().save_related(request, form, formsets, change)
+        upload = form.instance
+        if change or not upload.image:
+            return
+        if not getattr(settings, "RECEIPT_PARSE_ON_UPLOAD", True):
+            return
+        self._run_pipeline(request, [upload])
+
+    def _run_pipeline(self, request, uploads, create_checks=None):
+        """Read each receipt and, when asked, build its draft check."""
+        if create_checks is None:
+            create_checks = getattr(settings, "RECEIPT_CREATE_CHECK_ON_PARSE", True)
+
+        for upload in uploads:
+            if not upload.parse():
+                self.message_user(
+                    request, f"Could not read {upload}: {upload.error}", messages.ERROR
+                )
+                continue
+            if not create_checks:
+                self.message_user(request, f"Read {upload}.", messages.SUCCESS)
+                continue
+            check = upload.create_check()
+            self.message_user(
+                request,
+                format_html(
+                    'Read {} and created draft check <a href="{}">{}</a> — review it before settling.',
+                    upload,
+                    reverse("admin:checks_check_change", args=[check.pk]),
+                    check,
+                ),
+                messages.SUCCESS,
+            )
+
+    @admin.action(description="Read selected receipts with Claude")
+    def parse_receipts(self, request, queryset):
+        self._run_pipeline(request, list(queryset), create_checks=False)
+
+    @admin.action(description="Create checks from selected receipts")
+    def create_checks(self, request, queryset):
+        for upload in queryset:
+            if not upload.parsed_data:
+                self.message_user(
+                    request, f"{upload} has not been read yet.", messages.WARNING
+                )
+                continue
+            check = upload.create_check()
+            self.message_user(
+                request,
+                format_html(
+                    'Created <a href="{}">{}</a>.',
+                    reverse("admin:checks_check_change", args=[check.pk]),
+                    check,
+                ),
+                messages.SUCCESS,
+            )

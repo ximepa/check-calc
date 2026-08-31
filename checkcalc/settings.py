@@ -131,9 +131,30 @@ USE_TZ = True
 STATIC_URL = "static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
 
+# Uploaded receipt photos.
+MEDIA_URL = "media/"
+MEDIA_ROOT = Path(os.environ.get("DJANGO_MEDIA_ROOT", BASE_DIR / "media"))
+# Receipt photos are big; keep them out of memory and off the request path.
+FILE_UPLOAD_MAX_MEMORY_SIZE = 5 * 1024 * 1024
+DATA_UPLOAD_MAX_MEMORY_SIZE = 25 * 1024 * 1024
+
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 LOGIN_REDIRECT_URL = "/admin/"
 
 # The currency symbol the admin uses when rendering money columns.
 CURRENCY_SYMBOL = os.environ.get("CHECKCALC_CURRENCY_SYMBOL", "$")
+
+
+# Receipt parsing (Claude API)
+# ---------------------------
+# ANTHROPIC_API_KEY may be left unset: the SDK also picks up
+# ANTHROPIC_AUTH_TOKEN or a profile written by `ant auth login`.
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+RECEIPT_PARSER_MODEL = os.environ.get("RECEIPT_PARSER_MODEL", "claude-opus-5")
+RECEIPT_PARSER_TIMEOUT = float(os.environ.get("RECEIPT_PARSER_TIMEOUT", "120"))
+
+# Read a receipt as soon as it is uploaded, and build a draft check from it.
+# Turn these off to upload now and parse later from the admin actions.
+RECEIPT_PARSE_ON_UPLOAD = env_bool("RECEIPT_PARSE_ON_UPLOAD", default=True)
+RECEIPT_CREATE_CHECK_ON_PARSE = env_bool("RECEIPT_CREATE_CHECK_ON_PARSE", default=True)
