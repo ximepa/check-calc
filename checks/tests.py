@@ -545,6 +545,22 @@ class ReceiptAdminTests(TestCase):
         self.assertEqual(upload.bill.items.count(), 2)
         self.parse_mock.assert_not_called()
 
+    def test_an_amount_that_cannot_be_read_renders_as_a_dash(self):
+        # An unusable amount in the stored JSON makes to_decimal() return None,
+        # which the money column has to render without interpolating anything.
+        ReceiptUpload.objects.create(
+            image=upload_file(),
+            parsed_data=dict(SAMPLE_PARSE, total="n/a", tax_amount="?"),
+            status=ReceiptUpload.Status.PARSED,
+        )
+        changelist = self.client.get(reverse("admin:checks_receiptupload_changelist"))
+        change = self.client.get(
+            reverse("admin:checks_receiptupload_change", args=[ReceiptUpload.objects.get().pk])
+        )
+        self.assertEqual(changelist.status_code, 200)
+        self.assertEqual(change.status_code, 200)
+        self.assertContains(change, "\u2014")
+
     def test_the_upload_screens_render(self):
         upload = ReceiptUpload.objects.create(
             image=upload_file(), parsed_data=SAMPLE_PARSE, status=ReceiptUpload.Status.PARSED
