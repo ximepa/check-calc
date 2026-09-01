@@ -22,7 +22,9 @@ ZERO = Decimal("0.00")
 def currency(amount):
     """Render a Decimal as right-aligned money, negatives in red."""
     if amount is None:
-        return format_html('<span class="cc-money">&mdash;</span>')
+        # format_html() requires interpolation arguments since Django 6.0, and
+        # the em dash is passed as one rather than written as an HTML entity.
+        return format_html('<span class="cc-money">{}</span>', "\u2014")
     symbol = getattr(settings, "CURRENCY_SYMBOL", "$")
     negative = amount < 0
     return format_html(
