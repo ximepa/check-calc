@@ -22,7 +22,9 @@ ZERO = Decimal("0.00")
 def currency(amount):
     """Render a Decimal as right-aligned money, negatives in red."""
     if amount is None:
-        return format_html('<span class="cc-money">&mdash;</span>')
+        # format_html() requires interpolation arguments since Django 6.0, and
+        # the em dash is passed as one rather than written as an HTML entity.
+        return format_html('<span class="cc-money">{}</span>', "\u2014")
     symbol = getattr(settings, "CURRENCY_SYMBOL", "$")
     negative = amount < 0
     return format_html(
@@ -500,10 +502,12 @@ class ReceiptUploadAdmin(admin.ModelAdmin):
         if not obj.document:
             return "—"
         if obj.is_pdf:
+            # format_html() requires interpolation arguments since Django 6.0.
             return format_html(
                 '<span style="display:inline-block;width:52px;height:52px;line-height:52px;'
                 'text-align:center;border:1px solid #ccc;border-radius:4px;background:#fafafa;'
-                'font-size:11px;font-weight:700;color:#b32d2e">PDF</span>'
+                'font-size:11px;font-weight:700;color:#b32d2e">{}</span>',
+                "PDF",
             )
         return format_html(
             '<img src="{}" style="height:52px;width:52px;object-fit:cover;'

@@ -25,6 +25,10 @@ nothing**.
   every check. Extras are allocated in proportion to what each person ate, and
   the rows are guaranteed to add up to the check total, cent for cent.
 
+## Requirements
+
+Django 6.1, which needs **Python 3.12 or newer** and SQLite 3.37 or newer.
+
 ## Quick start
 
 ```bash

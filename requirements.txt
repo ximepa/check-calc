@@ -1,5 +1,5 @@
-Django>=5.2,<6.0
-Pillow>=11.0          # ImageField support and local image downscaling
+Django>=6.1,<6.2      # needs Python 3.12+ and SQLite 3.37+
+Pillow>=12.0          # ImageField support and local image downscaling
 pypdf>=6.0            # reads the text layer out of digital PDFs
 pypdfium2>=5.0        # renders scanned PDFs to images
 
