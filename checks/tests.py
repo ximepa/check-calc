@@ -3,6 +3,7 @@
 import base64
 import io
 import json
+import logging
 import os
 import tempfile
 import threading
@@ -31,10 +32,17 @@ from .models import (
 )
 from .parsing import (
     MAX_EDGE,
+    ClaudeBackend,
+    GeminiBackend,
+    OllamaBackend,
     ParsedReceipt,
     ReceiptParseError,
-    parse_receipt_image,
+    gemini_schema,
+    get_backend,
+    parse_receipt_document,
+    prepare_document,
     prepare_image,
+    receipt_json_schema,
 )
 
 
@@ -299,6 +307,60 @@ def upload_file(name="receipt.jpg", **kwargs):
     return SimpleUploadedFile(name, make_image(**kwargs), content_type="image/jpeg")
 
 
+RECEIPT_LINES = [
+    "TRATTORIA NOVA",
+    "Via Roma 14, Bologna",
+    "2026-05-10 19:42",
+    "Margherita pizza      14.50",
+    "Espresso  x2           6.00",
+    "SUBTOTAL              20.50",
+    "TAX 10%                2.05",
+    "TOTAL                 22.55",
+]
+
+
+def text_pdf(lines):
+    """A minimal one-page PDF carrying a real text layer."""
+    stream = (
+        "BT /F1 12 Tf 40 760 Td 14 TL\n"
+        + "".join(f"({line}) Tj T*\n" for line in lines)
+        + "ET"
+    )
+    objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] "
+        "/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        f"<< /Length {len(stream)} >>\nstream\n{stream}\nendstream",
+    ]
+    out = io.BytesIO()
+    out.write(b"%PDF-1.4\n")
+    offsets = []
+    for number, body in enumerate(objects, start=1):
+        offsets.append(out.tell())
+        out.write(f"{number} 0 obj\n{body}\nendobj\n".encode())
+    xref = out.tell()
+    out.write(f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n".encode())
+    for offset in offsets:
+        out.write(f"{offset:010d} 00000 n \n".encode())
+    out.write(
+        f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n"
+        f"startxref\n{xref}\n%%EOF\n".encode()
+    )
+    return out.getvalue()
+
+
+def scanned_pdf(pages=1):
+    """A PDF made of images only — no text layer, like a flatbed scan."""
+    from PIL import Image
+
+    sheets = [Image.new("RGB", (600, 850), (252, 252, 250)) for _ in range(pages)]
+    out = io.BytesIO()
+    sheets[0].save(out, format="PDF", save_all=True, append_images=sheets[1:])
+    return out.getvalue()
+
+
 SAMPLE_PARSE = {
     "is_receipt": True,
     "merchant": "Trattoria Nova",
@@ -410,11 +472,11 @@ class BuildCheckTests(TestCase):
 @override_settings(MEDIA_ROOT=tempfile.mkdtemp())
 class ReceiptUploadTests(TestCase):
     def test_parsing_stores_the_result_and_token_usage(self):
-        upload = ReceiptUpload.objects.create(image=upload_file())
+        upload = ReceiptUpload.objects.create(document=upload_file())
         usage = {"model": "claude-opus-5", "input_tokens": 900, "output_tokens": 120}
 
         with mock.patch(
-            "checks.parsing.parse_receipt_image",
+            "checks.parsing.parse_receipt_document",
             return_value=(ParsedReceipt.model_validate(SAMPLE_PARSE), usage),
         ):
             self.assertTrue(upload.parse())
@@ -427,10 +489,10 @@ class ReceiptUploadTests(TestCase):
         self.assertIsNotNone(upload.parsed_at)
 
     def test_a_failure_is_recorded_on_the_row_rather_than_raised(self):
-        upload = ReceiptUpload.objects.create(image=upload_file())
+        upload = ReceiptUpload.objects.create(document=upload_file())
 
         with mock.patch(
-            "checks.parsing.parse_receipt_image",
+            "checks.parsing.parse_receipt_document",
             side_effect=ReceiptParseError("Too blurred to read."),
         ):
             self.assertFalse(upload.parse())
@@ -442,7 +504,7 @@ class ReceiptUploadTests(TestCase):
 
     def test_creating_a_check_links_it_back_to_the_upload(self):
         upload = ReceiptUpload.objects.create(
-            image=upload_file(), parsed_data=SAMPLE_PARSE, status=ReceiptUpload.Status.PARSED
+            document=upload_file(), parsed_data=SAMPLE_PARSE, status=ReceiptUpload.Status.PARSED
         )
         check = upload.create_check()
 
@@ -452,7 +514,7 @@ class ReceiptUploadTests(TestCase):
         self.assertEqual(check.uploads.get(), upload)
 
     def test_a_check_cannot_be_created_before_the_receipt_is_read(self):
-        upload = ReceiptUpload.objects.create(image=upload_file())
+        upload = ReceiptUpload.objects.create(document=upload_file())
         with self.assertRaises(ValueError):
             upload.create_check()
 
@@ -467,7 +529,7 @@ class ReceiptAdminTests(TestCase):
     def setUp(self):
         self.client.force_login(self.user)
         patcher = mock.patch(
-            "checks.parsing.parse_receipt_image",
+            "checks.parsing.parse_receipt_document",
             return_value=(
                 ParsedReceipt.model_validate(SAMPLE_PARSE),
                 {"model": "claude-opus-5", "input_tokens": 900, "output_tokens": 120},
@@ -479,7 +541,7 @@ class ReceiptAdminTests(TestCase):
     def post_upload(self, **extra):
         return self.client.post(
             reverse("admin:checks_receiptupload_add"),
-            {"image": upload_file(), "participants": [], **extra},
+            {"document": upload_file(), "participants": [], **extra},
             follow=True,
         )
 
@@ -522,7 +584,7 @@ class ReceiptAdminTests(TestCase):
         self.parse_mock.assert_not_called()
 
     def test_the_read_action_parses_without_creating_a_check(self):
-        upload = ReceiptUpload.objects.create(image=upload_file())
+        upload = ReceiptUpload.objects.create(document=upload_file())
         self.client.post(
             reverse("admin:checks_receiptupload_changelist"),
             {"action": "parse_receipts", "_selected_action": [str(upload.pk)]},
@@ -534,7 +596,7 @@ class ReceiptAdminTests(TestCase):
 
     def test_the_create_action_builds_a_check_from_stored_data(self):
         upload = ReceiptUpload.objects.create(
-            image=upload_file(), parsed_data=SAMPLE_PARSE, status=ReceiptUpload.Status.PARSED
+            document=upload_file(), parsed_data=SAMPLE_PARSE, status=ReceiptUpload.Status.PARSED
         )
         self.client.post(
             reverse("admin:checks_receiptupload_changelist"),
@@ -547,7 +609,7 @@ class ReceiptAdminTests(TestCase):
 
     def test_the_upload_screens_render(self):
         upload = ReceiptUpload.objects.create(
-            image=upload_file(), parsed_data=SAMPLE_PARSE, status=ReceiptUpload.Status.PARSED
+            document=upload_file(), parsed_data=SAMPLE_PARSE, status=ReceiptUpload.Status.PARSED
         )
         changelist = self.client.get(reverse("admin:checks_receiptupload_changelist"))
         change = self.client.get(
@@ -556,7 +618,7 @@ class ReceiptAdminTests(TestCase):
         self.assertEqual(changelist.status_code, 200)
         self.assertEqual(change.status_code, 200)
         self.assertContains(change, "Margherita pizza")
-        self.assertContains(change, "What Claude read")
+        self.assertContains(change, "What the model read")
 
 
 class StubAnthropicServer(ThreadingHTTPServer):
@@ -626,7 +688,7 @@ class ClaudeRequestTests(TestCase):
 
     @override_settings(ANTHROPIC_API_KEY="sk-ant-stub")
     def test_the_request_is_a_vision_call_with_a_json_schema(self):
-        parsed, usage = parse_receipt_image(make_image(size=(3000, 4000)))
+        parsed, usage = parse_receipt_document(make_image(size=(3000, 4000)))
 
         body = self.server.request_body
         self.assertEqual(body["model"], "claude-opus-5")
@@ -642,11 +704,20 @@ class ClaudeRequestTests(TestCase):
         self.assertFalse(schema["schema"]["additionalProperties"])
 
         self.assertEqual(parsed.merchant, "Trattoria Nova")
-        self.assertEqual(usage, {"model": "claude-opus-5", "input_tokens": 1234, "output_tokens": 210})
+        self.assertEqual(
+            usage,
+            {
+                "backend": "claude",
+                "pages": 1,
+                "model": "claude-opus-5",
+                "input_tokens": 1234,
+                "output_tokens": 210,
+            },
+        )
 
     @override_settings(ANTHROPIC_API_KEY="sk-ant-stub")
     def test_the_photo_is_downscaled_before_it_is_sent(self):
-        parse_receipt_image(make_image(size=(3000, 4000)))
+        parse_receipt_document(make_image(size=(3000, 4000)))
 
         source = self.server.request_body["messages"][0]["content"][0]["source"]
         decoded = base64.standard_b64decode(source["data"])
@@ -661,14 +732,14 @@ class ClaudeRequestTests(TestCase):
             SAMPLE_PARSE, is_receipt=False, items=[], reader_notes="This is a photo of a dog."
         )
         with self.assertRaises(ReceiptParseError) as caught:
-            parse_receipt_image(make_image())
+            parse_receipt_document(make_image())
         self.assertIn("photo of a dog", str(caught.exception))
 
     @override_settings(ANTHROPIC_API_KEY="sk-ant-stub")
     def test_a_receipt_with_no_readable_items_is_rejected(self):
         self.server.payload = dict(SAMPLE_PARSE, items=[], reader_notes="")
         with self.assertRaises(ReceiptParseError):
-            parse_receipt_image(make_image())
+            parse_receipt_document(make_image())
 
     @override_settings(ANTHROPIC_API_KEY="sk-ant-stub")
     def test_a_full_round_trip_produces_a_reconciled_check(self):
@@ -688,7 +759,7 @@ class ClaudeRequestTests(TestCase):
             "total": 305.5,
             "reader_notes": "",
         }
-        parsed, _ = parse_receipt_image(make_image())
+        parsed, _ = parse_receipt_document(make_image())
         check = build_check_from_parsed(parsed)
 
         self.assertEqual(check.subtotal, D("235.00"))
@@ -696,3 +767,314 @@ class ClaudeRequestTests(TestCase):
         self.assertEqual(check.tip_percent, D("10.00"))
         self.assertEqual(check.total, D("305.50"))
         self.assertNotIn("Total check:", check.notes)
+
+
+class PrepareDocumentTests(TestCase):
+    def test_a_pdf_with_a_text_layer_is_read_as_text(self):
+        document = prepare_document(
+            text_pdf(RECEIPT_LINES), "bill.pdf"
+        )
+        self.assertEqual(document.kind, "text")
+        self.assertIn("Margherita pizza", document.text)
+        self.assertFalse(document.image_bytes)
+
+    def test_a_scanned_pdf_falls_back_to_rendering_the_pages(self):
+        document = prepare_document(scanned_pdf(), "scan.pdf")
+        self.assertEqual(document.kind, "image")
+        self.assertEqual(document.media_type, "image/jpeg")
+        self.assertEqual(document.pages, 1)
+
+    def test_a_multi_page_scan_is_stitched_into_one_image(self):
+        one = prepare_document(scanned_pdf(pages=1), "scan.pdf")
+        two = prepare_document(scanned_pdf(pages=2), "scan.pdf")
+
+        from PIL import Image
+
+        self.assertEqual(two.pages, 2)
+        height = lambda doc: Image.open(io.BytesIO(doc.image_bytes)).size[1]
+        self.assertGreater(height(two), height(one))
+
+    def test_a_pdf_is_detected_from_its_content_not_its_name(self):
+        self.assertEqual(prepare_document(text_pdf(RECEIPT_LINES), "photo.jpg").kind, "text")
+
+    def test_a_pdf_whose_text_layer_is_nearly_empty_is_treated_as_a_scan(self):
+        # A stray watermark is not a text layer worth reading.
+        self.assertEqual(prepare_document(text_pdf(["x 1.00"]), "scan.pdf").kind, "image")
+
+    def test_photos_still_take_the_image_path(self):
+        self.assertEqual(prepare_document(make_image(), "receipt.jpg").kind, "image")
+
+    def test_a_corrupt_file_is_reported_clearly(self):
+        logging.disable(logging.CRITICAL)  # pypdf logs the damage itself
+        self.addCleanup(logging.disable, logging.NOTSET)
+        with self.assertRaises(ReceiptParseError):
+            prepare_document(b"%PDF-1.4 but not really", "broken.pdf")
+
+
+class SchemaTests(TestCase):
+    def test_the_shared_schema_has_no_references_left_in_it(self):
+        self.assertNotIn("$ref", json.dumps(receipt_json_schema()))
+        self.assertNotIn("$defs", json.dumps(receipt_json_schema()))
+
+    def test_the_gemini_schema_uses_its_own_dialect(self):
+        schema = gemini_schema()
+        self.assertEqual(schema["type"], "OBJECT")
+        self.assertEqual(schema["properties"]["items"]["type"], "ARRAY")
+        self.assertEqual(schema["properties"]["items"]["items"]["type"], "OBJECT")
+        # Optional fields become nullable rather than a union with null.
+        self.assertTrue(schema["properties"]["merchant"]["nullable"])
+        self.assertEqual(schema["properties"]["merchant"]["type"], "STRING")
+        self.assertNotIn("anyOf", json.dumps(schema))
+        self.assertNotIn("additionalProperties", json.dumps(schema))
+
+
+class BackendSelectionTests(TestCase):
+    @override_settings(RECEIPT_PARSER_BACKEND="gemini")
+    def test_an_explicit_backend_is_used(self):
+        self.assertIsInstance(get_backend(), GeminiBackend)
+
+    @override_settings(RECEIPT_PARSER_BACKEND="nope")
+    def test_an_unknown_backend_names_the_valid_ones(self):
+        with self.assertRaises(ReceiptParseError) as caught:
+            get_backend()
+        self.assertIn("gemini", str(caught.exception))
+
+    @override_settings(
+        RECEIPT_PARSER_BACKEND="auto", GEMINI_API_KEY="k", ANTHROPIC_API_KEY="k"
+    )
+    def test_auto_prefers_the_free_tier_when_both_keys_exist(self):
+        self.assertIsInstance(get_backend(), GeminiBackend)
+
+    @override_settings(RECEIPT_PARSER_BACKEND="auto", GEMINI_API_KEY="", ANTHROPIC_API_KEY="k")
+    def test_auto_falls_back_to_claude_when_only_that_key_exists(self):
+        self.assertIsInstance(get_backend(), ClaudeBackend)
+
+    @override_settings(RECEIPT_PARSER_BACKEND="auto", GEMINI_API_KEY="", ANTHROPIC_API_KEY="")
+    def test_auto_lands_on_ollama_when_nothing_is_configured(self):
+        self.assertIsInstance(get_backend(), OllamaBackend)
+
+
+class StubBackendServer(ThreadingHTTPServer):
+    daemon_threads = True
+    request_body = None
+    response_body = None
+    status = 200
+
+
+class _BackendHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        self.server.request_body = json.loads(
+            self.rfile.read(int(self.headers["Content-Length"]))
+        )
+        self.server.request_headers = {k.lower(): v for k, v in self.headers.items()}
+        body = json.dumps(self.server.response_body).encode()
+        self.send_response(self.server.status)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+class FreeBackendTests(TestCase):
+    """Drive the Gemini and Ollama HTTP paths against a local stub."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.server = StubBackendServer(("127.0.0.1", 0), _BackendHandler)
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.base_url = f"http://127.0.0.1:{cls.server.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        super().tearDownClass()
+
+    def setUp(self):
+        self.server.request_body = None
+        self.server.status = 200
+
+    # -- Gemini ---------------------------------------------------------
+
+    def gemini_reply(self, payload=None, **extra):
+        self.server.response_body = {
+            "candidates": [
+                {
+                    "content": {"parts": [{"text": json.dumps(payload or SAMPLE_PARSE)}]},
+                    "finishReason": "STOP",
+                }
+            ],
+            "usageMetadata": {"promptTokenCount": 800, "candidatesTokenCount": 150},
+            "modelVersion": "gemini-2.5-flash",
+            **extra,
+        }
+        return override_settings(
+            RECEIPT_GEMINI_ENDPOINT=self.base_url + "/v1beta/models/{model}:generateContent"
+        )
+
+    @override_settings(GEMINI_API_KEY="test-key", RECEIPT_PARSER_BACKEND="gemini")
+    def test_gemini_sends_an_inline_image_and_its_own_schema(self):
+        with self.gemini_reply():
+            parsed, usage = parse_receipt_document(make_image(size=(2400, 3000)), "receipt.jpg")
+
+        body = self.server.request_body
+        self.assertEqual(body["contents"][0]["parts"][0]["inline_data"]["mime_type"], "image/jpeg")
+        self.assertEqual(body["generationConfig"]["responseMimeType"], "application/json")
+        self.assertEqual(body["generationConfig"]["responseSchema"]["type"], "OBJECT")
+        self.assertTrue(body["systemInstruction"]["parts"][0]["text"])
+        self.assertEqual(self.server.request_headers["x-goog-api-key"], "test-key")
+
+        self.assertEqual(parsed.merchant, "Trattoria Nova")
+        self.assertEqual(usage["backend"], "gemini")
+        self.assertEqual(usage["input_tokens"], 800)
+
+    @override_settings(GEMINI_API_KEY="test-key", RECEIPT_PARSER_BACKEND="gemini")
+    def test_gemini_gets_text_rather_than_a_picture_for_a_digital_pdf(self):
+        with self.gemini_reply():
+            parse_receipt_document(text_pdf(RECEIPT_LINES), "bill.pdf")
+
+        parts = self.server.request_body["contents"][0]["parts"]
+        self.assertEqual(len(parts), 1)
+        self.assertIn("Margherita pizza", parts[0]["text"])
+
+    @override_settings(GEMINI_API_KEY="", RECEIPT_PARSER_BACKEND="gemini")
+    def test_gemini_without_a_key_explains_where_to_get_one(self):
+        with self.assertRaises(ReceiptParseError) as caught:
+            parse_receipt_document(make_image(), "receipt.jpg")
+        self.assertIn("aistudio.google.com", str(caught.exception))
+
+    @override_settings(GEMINI_API_KEY="test-key", RECEIPT_PARSER_BACKEND="gemini")
+    def test_a_gemini_quota_error_surfaces_the_reason(self):
+        with self.gemini_reply():
+            self.server.status = 429
+            self.server.response_body = {"error": {"message": "Quota exceeded for free tier"}}
+            with self.assertRaises(ReceiptParseError) as caught:
+                parse_receipt_document(make_image(), "receipt.jpg")
+        self.assertIn("Quota exceeded", str(caught.exception))
+
+    @override_settings(GEMINI_API_KEY="test-key", RECEIPT_PARSER_BACKEND="gemini")
+    def test_a_blocked_prompt_is_reported(self):
+        with self.gemini_reply():
+            self.server.response_body = {"promptFeedback": {"blockReason": "SAFETY"}}
+            with self.assertRaises(ReceiptParseError) as caught:
+                parse_receipt_document(make_image(), "receipt.jpg")
+        self.assertIn("SAFETY", str(caught.exception))
+
+    # -- Ollama ---------------------------------------------------------
+
+    def ollama_reply(self, content=None):
+        self.server.response_body = {
+            "model": "llama3.2-vision",
+            "message": {"role": "assistant", "content": content or json.dumps(SAMPLE_PARSE)},
+            "prompt_eval_count": 700,
+            "eval_count": 130,
+        }
+        return override_settings(
+            OLLAMA_HOST=self.base_url, RECEIPT_PARSER_BACKEND="ollama"
+        )
+
+    def test_ollama_sends_the_image_and_a_json_schema(self):
+        with self.ollama_reply():
+            parsed, usage = parse_receipt_document(make_image(), "receipt.jpg")
+
+        body = self.server.request_body
+        self.assertEqual(body["model"], "llama3.2-vision")
+        self.assertFalse(body["stream"])
+        self.assertEqual(body["messages"][0]["role"], "system")
+        self.assertEqual(len(body["messages"][1]["images"]), 1)
+        self.assertEqual(body["format"]["type"], "object")
+
+        self.assertEqual(parsed.merchant, "Trattoria Nova")
+        self.assertEqual(usage, {
+            "backend": "ollama",
+            "pages": 1,
+            "model": "llama3.2-vision",
+            "input_tokens": 700,
+            "output_tokens": 130,
+        })
+
+    def test_a_local_model_that_fences_its_json_is_still_understood(self):
+        fenced = "```json\n" + json.dumps(SAMPLE_PARSE) + "\n```"
+        with self.ollama_reply(content=fenced):
+            parsed, _ = parse_receipt_document(make_image(), "receipt.jpg")
+        self.assertEqual(parsed.merchant, "Trattoria Nova")
+
+    def test_output_that_is_not_json_is_reported_not_crashed(self):
+        with self.ollama_reply(content="I think this is a receipt for pizza."):
+            with self.assertRaises(ReceiptParseError) as caught:
+                parse_receipt_document(make_image(), "receipt.jpg")
+        self.assertIn("did not return JSON", str(caught.exception))
+
+    def test_output_with_the_wrong_field_types_is_reported(self):
+        broken = dict(SAMPLE_PARSE, items=[{"name": "Pizza", "unit_price": "free"}])
+        with self.ollama_reply(content=json.dumps(broken)):
+            with self.assertRaises(ReceiptParseError) as caught:
+                parse_receipt_document(make_image(), "receipt.jpg")
+        self.assertIn("unusable fields", str(caught.exception))
+
+    @override_settings(
+        OLLAMA_HOST="http://127.0.0.1:1", RECEIPT_PARSER_BACKEND="ollama"
+    )
+    def test_ollama_not_running_says_how_to_start_it(self):
+        with self.assertRaises(ReceiptParseError) as caught:
+            parse_receipt_document(make_image(), "receipt.jpg")
+        self.assertIn("ollama pull", str(caught.exception))
+
+
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp())
+class PdfUploadTests(TestCase):
+    """A PDF bill should reach a check the same way a photo does."""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = User.objects.create_superuser("admin", "admin@example.com", "pass1234")
+
+    def setUp(self):
+        self.client.force_login(self.user)
+
+    def test_uploading_a_pdf_creates_a_check(self):
+        pdf = SimpleUploadedFile(
+            "bill.pdf", text_pdf(RECEIPT_LINES), content_type="application/pdf"
+        )
+        with mock.patch(
+            "checks.parsing.parse_receipt_document",
+            return_value=(
+                ParsedReceipt.model_validate(SAMPLE_PARSE),
+                {"backend": "gemini", "pages": 1, "model": "gemini-2.5-flash",
+                 "input_tokens": 800, "output_tokens": 150},
+            ),
+        ):
+            response = self.client.post(
+                reverse("admin:checks_receiptupload_add"),
+                {"document": pdf, "participants": []},
+                follow=True,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        upload = ReceiptUpload.objects.get()
+        self.assertTrue(upload.is_pdf)
+        self.assertEqual(upload.backend, "gemini")
+        self.assertEqual(upload.bill.items.count(), 2)
+
+    def test_the_pdf_change_page_offers_the_file_instead_of_a_thumbnail(self):
+        upload = ReceiptUpload.objects.create(
+            document=SimpleUploadedFile("bill.pdf", text_pdf(RECEIPT_LINES)),
+            parsed_data=SAMPLE_PARSE,
+            status=ReceiptUpload.Status.PARSED,
+        )
+        response = self.client.get(
+            reverse("admin:checks_receiptupload_change", args=[upload.pk])
+        )
+        self.assertContains(response, "application/pdf")
+
+    def test_an_unsupported_file_type_is_rejected_by_the_form(self):
+        response = self.client.post(
+            reverse("admin:checks_receiptupload_add"),
+            {"document": SimpleUploadedFile("notes.txt", b"just text"), "participants": []},
+        )
+        self.assertContains(response, "File extension")
+        self.assertFalse(ReceiptUpload.objects.exists())

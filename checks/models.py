@@ -3,7 +3,7 @@
 from decimal import ROUND_HALF_UP, Decimal
 
 from django.conf import settings
-from django.core.validators import MinValueValidator
+from django.core.validators import FileExtensionValidator, MinValueValidator
 from django.db import models
 from django.db.models import F, Sum
 from django.utils import timezone
@@ -340,7 +340,13 @@ class ReceiptUpload(models.Model):
         IMPORTED = "imported", "Check created"
         FAILED = "failed", "Could not be read"
 
-    image = models.ImageField(upload_to="receipts/%Y/%m/")
+    RECEIPT_EXTENSIONS = ["jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff", "pdf"]
+
+    document = models.FileField(
+        upload_to="receipts/%Y/%m/",
+        validators=[FileExtensionValidator(RECEIPT_EXTENSIONS)],
+        help_text="Photo, scan or PDF of the receipt.",
+    )
     status = models.CharField(max_length=10, choices=Status.choices, default=Status.PENDING)
     bill = models.ForeignKey(
         Check,
@@ -359,6 +365,7 @@ class ReceiptUpload(models.Model):
 
     parsed_data = models.JSONField(null=True, blank=True, editable=False)
     error = models.TextField(blank=True, editable=False)
+    backend = models.CharField(max_length=32, blank=True, editable=False)
     model_used = models.CharField(max_length=64, blank=True, editable=False)
     input_tokens = models.PositiveIntegerField(null=True, blank=True, editable=False)
     output_tokens = models.PositiveIntegerField(null=True, blank=True, editable=False)
@@ -382,26 +389,30 @@ class ReceiptUpload(models.Model):
         return merchant or f"Receipt #{self.pk or 'new'}"
 
     @property
+    def is_pdf(self):
+        return self.document.name.lower().endswith(".pdf")
+
+    @property
     def reader_notes(self):
         """What the model flagged as unreadable or worth checking."""
         return (self.parsed_data or {}).get("reader_notes", "")
 
     def parse(self, save=True):
-        """Read the image with Claude and store the structured result.
+        """Read the file with the configured backend and store the result.
 
         Failures are recorded on the row rather than raised, so a bad photo
         leaves an explanation in the admin instead of a 500.
         """
-        from .parsing import ReceiptParseError, parse_receipt_image
+        from .parsing import ReceiptParseError, parse_receipt_document
 
-        self.image.open("rb")
+        self.document.open("rb")
         try:
-            raw = self.image.read()
+            raw = self.document.read()
         finally:
-            self.image.close()
+            self.document.close()
 
         try:
-            parsed, usage = parse_receipt_image(raw)
+            parsed, usage = parse_receipt_document(raw, filename=self.document.name)
         except ReceiptParseError as exc:
             self.status = self.Status.FAILED
             self.error = str(exc)
@@ -411,6 +422,7 @@ class ReceiptUpload(models.Model):
             self.error = ""
             self.parsed_data = parsed.model_dump()
             self.model_used = usage.get("model", "")
+            self.backend = usage.get("backend", "")
             self.input_tokens = usage.get("input_tokens")
             self.output_tokens = usage.get("output_tokens")
         self.parsed_at = timezone.now()
@@ -421,6 +433,7 @@ class ReceiptUpload(models.Model):
                     "status",
                     "error",
                     "parsed_data",
+                    "backend",
                     "model_used",
                     "input_tokens",
                     "output_tokens",

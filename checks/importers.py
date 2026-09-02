@@ -1,7 +1,7 @@
 """Build check records out of parsed receipt data.
 
 Kept separate from the parser so the mapping can be tested — and re-run from
-stored JSON — without touching the Claude API.
+stored JSON — without calling any model.
 """
 
 from datetime import date

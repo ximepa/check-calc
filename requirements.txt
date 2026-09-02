@@ -1,3 +1,8 @@
 Django>=5.2,<6.0
-anthropic>=1.2,<2.0   # reads receipt photos via the Claude API
 Pillow>=11.0          # ImageField support and local image downscaling
+pypdf>=6.0            # reads the text layer out of digital PDFs
+pypdfium2>=5.0        # renders scanned PDFs to images
+
+# Only needed for the Claude backend; the free Gemini and Ollama backends
+# talk plain HTTP and need nothing extra.
+anthropic>=1.2,<2.0

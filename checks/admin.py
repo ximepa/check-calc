@@ -428,19 +428,20 @@ class PaymentAdmin(admin.ModelAdmin):
 
 @admin.register(ReceiptUpload)
 class ReceiptUploadAdmin(admin.ModelAdmin):
-    """Upload a photo of a receipt; Claude reads it and a draft check appears."""
+    """Upload a receipt; the configured model reads it and a draft check appears."""
 
     list_display = (
         "thumbnail",
         "__str__",
         "status_badge",
+        "backend",
         "parsed_items",
         "parsed_total",
         "linked_check",
         "uploaded_at",
     )
     list_display_links = ("thumbnail", "__str__")
-    list_filter = ("status", "uploaded_at")
+    list_filter = ("status", "backend", "uploaded_at")
     search_fields = ("bill__title", "error")
     date_hierarchy = "uploaded_at"
     autocomplete_fields = ["participants"]
@@ -451,10 +452,10 @@ class ReceiptUploadAdmin(admin.ModelAdmin):
         (
             None,
             {
-                "fields": ("image", "participants"),
+                "fields": ("document", "participants"),
                 "description": (
-                    "Upload a photo of the receipt. It is read automatically on save "
-                    "and a draft check is created from it."
+                    "Upload a photo, scan or PDF of the receipt. It is read "
+                    "automatically on save and a draft check is created from it."
                 ),
             },
         ),
@@ -462,7 +463,14 @@ class ReceiptUploadAdmin(admin.ModelAdmin):
         (
             "Request",
             {
-                "fields": ("model_used", "input_tokens", "output_tokens", "uploaded_by", "parsed_at"),
+                "fields": (
+                    "backend",
+                    "model_used",
+                    "input_tokens",
+                    "output_tokens",
+                    "uploaded_by",
+                    "parsed_at",
+                ),
                 "classes": ("collapse",),
             },
         ),
@@ -473,6 +481,7 @@ class ReceiptUploadAdmin(admin.ModelAdmin):
         "parsed_panel",
         "linked_check",
         "error",
+        "backend",
         "model_used",
         "input_tokens",
         "output_tokens",
@@ -487,22 +496,36 @@ class ReceiptUploadAdmin(admin.ModelAdmin):
 
     @admin.display(description="")
     def thumbnail(self, obj):
-        if not obj.image:
+        """A picture for photos; PDFs get a badge, since they cannot be shown."""
+        if not obj.document:
             return "—"
+        if obj.is_pdf:
+            return format_html(
+                '<span style="display:inline-block;width:52px;height:52px;line-height:52px;'
+                'text-align:center;border:1px solid #ccc;border-radius:4px;background:#fafafa;'
+                'font-size:11px;font-weight:700;color:#b32d2e">PDF</span>'
+            )
         return format_html(
             '<img src="{}" style="height:52px;width:52px;object-fit:cover;'
             'border-radius:4px;border:1px solid #ccc" alt="receipt">',
-            obj.image.url,
+            obj.document.url,
         )
 
     @admin.display(description="Receipt")
     def preview(self, obj):
-        if not obj.image:
+        if not obj.document:
             return "—"
+        if obj.is_pdf:
+            return format_html(
+                '<embed src="{0}" type="application/pdf" width="420" height="560" '
+                'style="border:1px solid #ccc;border-radius:4px">'
+                '<p><a href="{0}" target="_blank">Open the PDF</a></p>',
+                obj.document.url,
+            )
         return format_html(
             '<a href="{0}" target="_blank"><img src="{0}" style="max-width:420px;'
             'max-height:560px;border:1px solid #ccc;border-radius:4px"></a>',
-            obj.image.url,
+            obj.document.url,
         )
 
     @admin.display(description="Status", ordering="status")
@@ -541,7 +564,7 @@ class ReceiptUploadAdmin(admin.ModelAdmin):
             obj.bill,
         )
 
-    @admin.display(description="What Claude read")
+    @admin.display(description="What the model read")
     def parsed_panel(self, obj):
         data = obj.parsed_data
         if not data:
@@ -595,7 +618,7 @@ class ReceiptUploadAdmin(admin.ModelAdmin):
         """Parse after the participants M2M is saved, so shares can be assigned."""
         super().save_related(request, form, formsets, change)
         upload = form.instance
-        if change or not upload.image:
+        if change or not upload.document:
             return
         if not getattr(settings, "RECEIPT_PARSE_ON_UPLOAD", True):
             return
@@ -627,7 +650,7 @@ class ReceiptUploadAdmin(admin.ModelAdmin):
                 messages.SUCCESS,
             )
 
-    @admin.action(description="Read selected receipts with Claude")
+    @admin.action(description="Read selected receipts")
     def parse_receipts(self, request, queryset):
         self._run_pipeline(request, list(queryset), create_checks=False)
 

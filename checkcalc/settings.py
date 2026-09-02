@@ -146,13 +146,29 @@ LOGIN_REDIRECT_URL = "/admin/"
 CURRENCY_SYMBOL = os.environ.get("CHECKCALC_CURRENCY_SYMBOL", "$")
 
 
-# Receipt parsing (Claude API)
-# ---------------------------
-# ANTHROPIC_API_KEY may be left unset: the SDK also picks up
+# Receipt parsing
+# ---------------
+# Which model reads uploaded receipts: "gemini", "ollama", "claude", or "auto"
+# to take the first one that is configured (Gemini, then Claude, then Ollama —
+# which needs no key at all).
+RECEIPT_PARSER_BACKEND = os.environ.get("RECEIPT_PARSER_BACKEND", "auto")
+RECEIPT_PARSER_TIMEOUT = float(os.environ.get("RECEIPT_PARSER_TIMEOUT", "120"))
+
+# Gemini — free tier, no card required. Key from aistudio.google.com/apikey.
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "") or os.environ.get("GOOGLE_API_KEY", "")
+RECEIPT_GEMINI_MODEL = os.environ.get("RECEIPT_GEMINI_MODEL", "gemini-2.5-flash")
+# Override only to route through a gateway or a regional endpoint.
+RECEIPT_GEMINI_ENDPOINT = os.environ.get("RECEIPT_GEMINI_ENDPOINT", "")
+
+# Ollama — a model on your own machine. Free and offline; needs a vision model
+# pulled (`ollama pull llama3.2-vision`) for photos and scans.
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+RECEIPT_OLLAMA_MODEL = os.environ.get("RECEIPT_OLLAMA_MODEL", "llama3.2-vision")
+
+# Claude — paid. The key may be left unset: the SDK also picks up
 # ANTHROPIC_AUTH_TOKEN or a profile written by `ant auth login`.
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-RECEIPT_PARSER_MODEL = os.environ.get("RECEIPT_PARSER_MODEL", "claude-opus-5")
-RECEIPT_PARSER_TIMEOUT = float(os.environ.get("RECEIPT_PARSER_TIMEOUT", "120"))
+RECEIPT_CLAUDE_MODEL = os.environ.get("RECEIPT_CLAUDE_MODEL", "claude-opus-5")
 
 # Read a receipt as soon as it is uploaded, and build a draft check from it.
 # Turn these off to upload now and parse later from the admin actions.
